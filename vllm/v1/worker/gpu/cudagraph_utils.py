@@ -99,6 +99,34 @@ class CreateForwardFn(Protocol):
     ) -> Callable[[CUDAGraphMode], None]: ...
 
 
+
+def make_custom_ar_batch_descriptor(
+    *,
+    num_tokens: int,
+    num_reqs: int | None,
+    uniform_token_count: int | None,
+    has_lora: bool,
+    num_active_loras: int,
+) -> BatchDescriptor | None:
+    """BatchDescriptor for RDNA custom all-reduce decode gating."""
+    import os as _os
+    if _os.environ.get("VLLM_RDNA_CUSTOM_AR_BATCHDESC", "1") != "1":
+        return None
+    if (
+        uniform_token_count == 1
+        and num_reqs is not None
+        and num_reqs == num_tokens
+    ):
+        return BatchDescriptor(
+            num_tokens=num_tokens,
+            num_reqs=num_reqs,
+            uniform=True,
+            has_lora=has_lora,
+            num_active_loras=num_active_loras,
+        )
+    return None
+
+
 def _is_compatible(
     desc: BatchExecutionDescriptor,
     num_reqs: int,
@@ -711,8 +739,14 @@ class ModelCudaGraphManager(CudaGraphManager):
             input_buffers.is_padding.fill_(True)
 
             def forward_fn(cg_mode: CUDAGraphMode) -> None:
-                batch_descriptor = None
-                if cg_mode == CUDAGraphMode.PIECEWISE:
+                batch_descriptor = make_custom_ar_batch_descriptor(
+                    num_tokens=num_tokens,
+                    num_reqs=num_reqs,
+                    uniform_token_count=desc.uniform_token_count,
+                    has_lora=has_lora,
+                    num_active_loras=desc.num_active_loras,
+                )
+                if batch_descriptor is None and cg_mode == CUDAGraphMode.PIECEWISE:
                     batch_descriptor = BatchDescriptor(
                         num_tokens=num_tokens,
                         has_lora=has_lora,

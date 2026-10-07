@@ -127,7 +127,7 @@ class ApplyRotaryEmb(CustomOp):
         if not current_platform.is_cpu():
             with suppress(ModuleNotFoundError):
                 self.apply_rotary_emb_flash_attn = import_module(
-                    "flash_attn.ops.triton.rotary"
+                    "vllm.third_party.flash_attn_rotary"
                 ).apply_rotary
 
     @staticmethod
