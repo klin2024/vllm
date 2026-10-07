@@ -108,12 +108,12 @@ def make_custom_ar_batch_descriptor(
     has_lora: bool,
     num_active_loras: int,
 ) -> BatchDescriptor | None:
-    """VLLM_RDNA_CUSTOM_AR_BATCHDESC=1 enables, =0 disables this patch
+    """VLLM_ROCM_USE_CUSTOM_AR_BATCHDESC=1 enables, =0 disables this patch
     at runtime (default enabled). Builds a BatchDescriptor for RDNA
     custom all-reduce decode gating so uniform single-token decode
     batches get a faster CUDA graph path."""
     import os as _os
-    if _os.environ.get("VLLM_RDNA_CUSTOM_AR_BATCHDESC", "1") != "1":
+    if _os.environ.get("VLLM_ROCM_USE_CUSTOM_AR_BATCHDESC", "1") != "1":
         return None
     if (
         uniform_token_count == 1

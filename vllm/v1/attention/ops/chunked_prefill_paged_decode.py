@@ -478,13 +478,13 @@ def chunked_prefill_paged_decode(
 
         from vllm.platforms.rocm import on_gfx1x
 
-        # VLLM_RDNA_SPLITKV_DECODE=1 enables, =0 disables this patch at
+        # VLLM_ROCM_USE_SPLITKV_DECODE=1 enables, =0 disables this patch at
         # runtime (default enabled). Selects the split-KV paged-attention
         # decode kernel for the head dimensions validated on the gfx1x
         # kernel suite.
         import os as _os
         use_splitkv_decode = (
-            _os.environ.get("VLLM_RDNA_SPLITKV_DECODE", "1") == "1"
+            _os.environ.get("VLLM_ROCM_USE_SPLITKV_DECODE", "1") == "1"
             and on_gfx1x()
             and query.dtype in (torch.float16, torch.bfloat16)
             and head_size in (128, 256, 512)
