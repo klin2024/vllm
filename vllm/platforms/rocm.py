@@ -750,7 +750,12 @@ class RocmPlatform(Platform):
 
         from vllm._aiter_ops import rocm_aiter_ops
 
-        if rocm_aiter_ops.is_mha_enabled() and on_cdna():
+        # VLLM_ROCM_USE_AITER=1 and VLLM_ROCM_USE_AITER_MHA=1 (both required)
+        # enable this; unset or either =0 disables it (falls through to the
+        # normal backend selection below). Bypasses the CDNA-only on_cdna()
+        # gate so the ViT (vision) attention backend can use AITER Flash
+        # Attention on RDNA/gfx1x hardware too.
+        if envs.VLLM_ROCM_USE_AITER and envs.VLLM_ROCM_USE_AITER_MHA:
             logger.info_once("Using AITER Flash Attention backend for ViT model.")
             return AttentionBackendEnum.ROCM_AITER_FA
 
