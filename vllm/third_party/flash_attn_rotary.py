@@ -1,3 +1,12 @@
+# Vendored from flash-attention so that vLLM can use this kernel without
+# requiring the flash_attn package to be installed.
+#
+#   repo   : https://github.com/Dao-AILab/flash-attention
+#   branch : main
+#   commit : a9a3170fc98cbd22a4cc870937b390f3d483f1eb  (2025-04-25)
+#   path   : flash_attn/ops/triton/rotary.py
+#   blob   : ff4017fda3e4a6e18cf3a51b34f0fb073d8f678a  (7088 bytes)
+
 # Copyright (c) 2025, Tri Dao.
 # As of 2025-04-23, we require triton >= 3.0
 
