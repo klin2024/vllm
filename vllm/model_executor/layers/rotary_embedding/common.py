@@ -123,11 +123,19 @@ class ApplyRotaryEmb(CustomOp):
         self.is_neox_style = is_neox_style
         self.enable_fp32_compute = enable_fp32_compute
 
+        # VLLM_ROCM_USE_FLASH_ATTN_ROTARY=1 enables, =0 disables this patch at
+        # runtime (default enabled). Uses the vendored flash_attn Triton
+        # rotary kernel (vllm/third_party/flash_attn_rotary.py) instead of
+        # requiring the flash_attn package to be installed; disabling
+        # falls back to the native PyTorch rotary embedding path below.
+        import os as _os
         self.apply_rotary_emb_flash_attn = None
-        if not current_platform.is_cpu():
+        if not current_platform.is_cpu() and _os.environ.get(
+            "VLLM_ROCM_USE_FLASH_ATTN_ROTARY", "1"
+        ) == "1":
             with suppress(ModuleNotFoundError):
                 self.apply_rotary_emb_flash_attn = import_module(
-                    "flash_attn.ops.triton.rotary"
+                    "vllm.third_party.flash_attn_rotary"
                 ).apply_rotary
 
     @staticmethod

@@ -173,6 +173,24 @@ def is_aiter_found_and_supported_on_rdna4() -> bool:
     return False
 
 
+def is_aiter_found_and_supported_on_gfx1x() -> bool:
+    """gfx1x (RDNA3/3.5) analog of `is_aiter_found_and_supported()`.
+
+    Only aiter's MHA Triton kernel has been validated on gfx1x, so this
+    deliberately stays off the gfx9/CK `@if_aiter_supported` umbrella --
+    it is OR'd in only at the specific is_mha_enabled() call site, leaving
+    every other `@if_aiter_supported`-gated feature (custom all-reduce,
+    shuffle KV cache, MLA, fused MoE, etc.) CDNA-gated exactly as before.
+    Checks platform + arch + library availability, not environment
+    variables.
+    """
+    if current_platform.is_rocm() and IS_AITER_FOUND:
+        from vllm.platforms.rocm import on_gfx1x
+
+        return on_gfx1x()
+    return False
+
+
 @functools.cache
 def _load_gemm_tuned_configs(
     csv_path: str,
@@ -2060,8 +2078,15 @@ class rocm_aiter_ops:
         return True
 
     @classmethod
-    @if_aiter_supported
     def is_mha_enabled(cls) -> bool:
+        # Deliberately not @if_aiter_supported: that umbrella is CDNA-only.
+        # gfx1x gets its own narrow support check (Triton MHA kernel only,
+        # validated separately from the other @if_aiter_supported features).
+        if not (
+            is_aiter_found_and_supported()
+            or is_aiter_found_and_supported_on_gfx1x()
+        ):
+            return False
         return cls._AITER_ENABLED and cls._MHA_ENABLED
 
     @classmethod

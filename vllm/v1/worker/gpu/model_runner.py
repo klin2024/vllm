@@ -106,6 +106,7 @@ from vllm.v1.worker.gpu.cudagraph_utils import (
     ModelCudaGraphManager,
     has_compiled_submodule,
     make_cudagraph_stats,
+    make_custom_ar_batch_descriptor,
 )
 from vllm.v1.worker.gpu.cudagraph_utils import (
     profile_cudagraph_memory as _profile_cudagraph_memory,
@@ -1909,11 +1910,35 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             model_output = self.cudagraph_manager.run_fullgraph(batch_desc)
         else:
             # For piecewise and eager mode, just call model().
-            batch_descriptor = BatchDescriptor(
+            batch_descriptor = make_custom_ar_batch_descriptor(
                 num_tokens=input_batch.num_tokens_after_padding,
+                num_reqs=batch_desc.num_reqs,
+                uniform_token_count=batch_desc.uniform_token_count,
                 has_lora=self.lora_config is not None,
                 num_active_loras=batch_desc.num_active_loras,
             )
+            if (
+                batch_descriptor is None
+                and batch_desc.cg_mode == CUDAGraphMode.PIECEWISE
+                and not np.any(
+                    input_batch.is_prefilling_np[: input_batch.num_reqs]
+                )
+            ):
+                # PIECEWISE descriptors intentionally omit decode metadata.
+                # Reconstruct it only for a pure decode graph execution.
+                batch_descriptor = BatchDescriptor(
+                    num_tokens=input_batch.num_tokens_after_padding,
+                    num_reqs=input_batch.num_tokens_after_padding,
+                    uniform=True,
+                    has_lora=self.lora_config is not None,
+                    num_active_loras=batch_desc.num_active_loras,
+                )
+            if batch_descriptor is None:
+                batch_descriptor = BatchDescriptor(
+                    num_tokens=input_batch.num_tokens_after_padding,
+                    has_lora=self.lora_config is not None,
+                    num_active_loras=batch_desc.num_active_loras,
+                )
 
             with set_forward_context(
                 attn_metadata,
