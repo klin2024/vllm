@@ -78,7 +78,11 @@ from vllm.utils.mem_utils import (
     format_gib,
     memory_profiling,
 )
-from vllm.utils.torch_utils import set_random_seed, set_torch_threads_for_runtime
+from vllm.utils.torch_utils import (
+    on_current_stream,
+    set_random_seed,
+    set_torch_threads_for_runtime,
+)
 from vllm.v1.attention.backends.utils import record_kv_cache_layout
 from vllm.v1.core.sched.output import GrammarOutput, SchedulerOutput
 from vllm.v1.kv_cache_interface import KVCacheConfig, KVCacheSpec
@@ -770,6 +774,7 @@ class Worker(WorkerBase):
             self.model_runner._init_kv_zero_meta()
 
     @instrument(span_name="Warmup (GPU)")
+    @on_current_stream
     def compile_or_warm_up_model(self) -> CompilationTimes:
         warmup_sizes: list[int] = []
 
@@ -1139,6 +1144,7 @@ class Worker(WorkerBase):
 
     @torch.inference_mode()
     @with_gpu_sync_check
+    @on_current_stream
     def sample_tokens(
         self, grammar_output: "GrammarOutput | None"
     ) -> ModelRunnerOutput | AsyncModelRunnerOutput:
@@ -1146,6 +1152,7 @@ class Worker(WorkerBase):
 
     @torch.inference_mode()
     @with_gpu_sync_check
+    @on_current_stream
     def execute_model(
         self, scheduler_output: "SchedulerOutput"
     ) -> ModelRunnerOutput | AsyncModelRunnerOutput | None:

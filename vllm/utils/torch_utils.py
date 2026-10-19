@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import contextlib
+import functools
 import importlib.metadata
 import os
 import random
@@ -830,7 +831,12 @@ def current_stream() -> torch.cuda.Stream:
         # for more details. Therefore, we create a dedicated stream per process.
         if current_platform.is_rocm() or current_platform.is_cuda():
             # Ensure new stream is ordered w.r.t. replaced stream's work.
-            new_stream = torch.cuda.Stream()
+            # VLLM_STREAM_PRIORITY=high asks for the highest priority torch
+            # reports (lower is higher; on ROCm the range is (0, -1)).
+            priority = 0
+            if envs.VLLM_STREAM_PRIORITY == "high":
+                priority = torch.cuda.Stream.priority_range()[1]
+            new_stream = torch.cuda.Stream(priority=priority)
             new_stream.wait_stream(torch.cuda.current_stream())
             # torch.cuda.set_stream here is the alias of _pathed_set_stream
             torch.cuda.set_stream(new_stream)
@@ -846,6 +852,33 @@ def current_stream() -> torch.cuda.Stream:
                     "may not support current_stream with torch API"
                 )
     return _current_stream_tls.value
+
+
+def on_current_stream(fn):
+    """Run `fn` with torch's current stream set to `current_stream()`.
+
+    Active only with VLLM_STREAM_PRIORITY=high; otherwise `fn` is returned
+    unchanged. A priority on vLLM's dedicated stream does nothing for work
+    that is not submitted to it, and outside graph capture the worker's model
+    execution runs on whatever torch's current stream is -- the null stream,
+    which always has normal priority. A HIP API trace of a gfx1151 server
+    showed every kernel launch, copy and graph launch of the inference path on
+    the null stream until the worker entry points were wrapped with this.
+
+    Off by default because it moves the forward pass to a stream other than
+    the one its memory was allocated on, and torch's caching allocator pools
+    free blocks per stream (see the note in GPUModelRunner on side-stream
+    forwards slowing decode).
+    """
+    if envs.VLLM_STREAM_PRIORITY != "high":
+        return fn
+
+    @functools.wraps(fn)
+    def wrapper(*args, **kwargs):
+        with torch.cuda.stream(current_stream()):
+            return fn(*args, **kwargs)
+
+    return wrapper
 
 
 # Global auxiliary stream for running operations in background streams.
