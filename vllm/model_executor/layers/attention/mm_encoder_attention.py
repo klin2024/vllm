@@ -7,6 +7,7 @@ import json
 import numpy as np
 import torch
 
+from vllm._aiter_ops import rocm_aiter_ops
 from vllm.config import MultiModalConfig
 from vllm.kernels.triton.qkv_padded_fp8_quant import (
     quantize_fp8_maybe_pad_head_dim,
@@ -227,16 +228,16 @@ class MMEncoderAttention(CustomOp):
         cu_seqlens: np.ndarray,
     ) -> int:
         max_seqlen = 0
-        if (
-            attn_backend
-            in (
-                AttentionBackendEnum.FLASH_ATTN,
-                AttentionBackendEnum.ROCM_AITER_FA,
-                AttentionBackendEnum.TRITON_ATTN,
-                AttentionBackendEnum.FLASHINFER,
-            )
-            and len(cu_seqlens) >= 2
-        ):
+        needs_max_seqlen = attn_backend in (
+            AttentionBackendEnum.FLASH_ATTN,
+            AttentionBackendEnum.ROCM_AITER_FA,
+            AttentionBackendEnum.TRITON_ATTN,
+            AttentionBackendEnum.FLASHINFER,
+        )
+        # The aiter fused vision attention replaces the backend's kernel and
+        # picks its tiles from the exact maximum as well.
+        needs_max_seqlen |= rocm_aiter_ops.is_rdna_vit_fused_attn_enabled()
+        if needs_max_seqlen and len(cu_seqlens) >= 2:
             max_seqlen = int((cu_seqlens[1:] - cu_seqlens[:-1]).max())
         if attn_backend == AttentionBackendEnum.FLASHINFER:
             max_seqlen = bucket_flashinfer_max_seqlen(max_seqlen)
