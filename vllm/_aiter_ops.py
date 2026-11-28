@@ -1994,6 +1994,72 @@ def _rocm_aiter_fp8_attn_fake(
     )
 
 
+def _rocm_aiter_vit_qkv_rope_attn_impl(
+    qkv: torch.Tensor,
+    num_heads: int,
+    cos: torch.Tensor,
+    sin: torch.Tensor,
+    cu_seqlens: torch.Tensor,
+    max_seqlen: torch.Tensor,
+    scale: float,
+) -> torch.Tensor:
+    """Vision attention in one FlyDSL kernel (gfx11): split the packed qkv
+    [tokens, 1, 3 * num_heads * head_dim], apply the NeoX rotary embedding
+    (cos / sin [tokens, rotary_dim / 2]) to q and k, then run varlen attention
+    over cu_seqlens. Returns [tokens, num_heads, head_dim]."""
+    from aiter.ops.flydsl import flydsl_flash_attn_varlen_qkv_rope_fwd
+
+    max_seqlen_value = int(max_seqlen.item())
+    if max_seqlen_value < 1:
+        # MMEncoderAttention.compute_max_seqlen() fills max_seqlen for this
+        # path; a caller that did not go through it gets the exact value here.
+        max_seqlen_value = int((cu_seqlens[1:] - cu_seqlens[:-1]).max().item())
+    if cu_seqlens.dtype != torch.int32:
+        cu_seqlens = cu_seqlens.to(torch.int32)
+    output = flydsl_flash_attn_varlen_qkv_rope_fwd(
+        qkv, num_heads, cos, sin, cu_seqlens, max_seqlen_value, scale
+    )
+    if output is None:
+        raise RuntimeError(
+            "aiter flydsl_flash_attn_varlen_qkv_rope_fwd does not cover this "
+            f"vision attention call (qkv {tuple(qkv.shape)} {qkv.dtype}, "
+            f"cos {tuple(cos.shape)} {cos.dtype}, {cu_seqlens.numel() - 1} "
+            "sequences); set VLLM_ROCM_USE_AITER_VIT_FUSED_ATTN=0 to keep the "
+            "default vision attention."
+        )
+    return output
+
+
+def _rocm_aiter_vit_qkv_rope_attn_fake(
+    qkv: torch.Tensor,
+    num_heads: int,
+    cos: torch.Tensor,
+    sin: torch.Tensor,
+    cu_seqlens: torch.Tensor,
+    max_seqlen: torch.Tensor,
+    scale: float,
+) -> torch.Tensor:
+    head_dim = qkv.shape[-1] // (3 * num_heads)
+    return qkv.new_empty((qkv.shape[0], num_heads, head_dim))
+
+
+@functools.cache
+def _aiter_has_vit_fused_attn() -> bool:
+    """The installed aiter ships flydsl_flash_attn_varlen_qkv_rope_fwd."""
+    try:
+        from aiter.ops.flydsl import (  # noqa: F401
+            flydsl_flash_attn_varlen_qkv_rope_fwd,
+        )
+    except ImportError:
+        logger.warning_once(
+            "VLLM_ROCM_USE_AITER_VIT_FUSED_ATTN is set but the installed aiter "
+            "has no flydsl_flash_attn_varlen_qkv_rope_fwd; the vision attention "
+            "keeps its default path."
+        )
+        return False
+    return True
+
+
 def _mhc_delayed_pre_tail(
     gemm_out: torch.Tensor,
     sqrsum: torch.Tensor,
@@ -2161,6 +2227,8 @@ class rocm_aiter_ops:
         VLLM_ROCM_USE_AITER_MOE: Controls MoE (Mixture of Experts) ops.
         VLLM_ROCM_USE_AITER_MLA: Controls MLA (Multi-head Latent Attention) ops.
         VLLM_ROCM_USE_AITER_MHA: Controls MHA ops including flash_attn_varlen.
+        VLLM_ROCM_USE_AITER_VIT_FUSED_ATTN: Controls the gfx11 FlyDSL fused
+            vision attention (qkv split + rotary embedding + attention).
         VLLM_ROCM_USE_AITER_UNIFIED_ATTENTION: Controls Triton unified attention.
         VLLM_ROCM_USE_AITER_FP8BMM: Controls FP8 batched matrix multiply.
         VLLM_ROCM_USE_AITER_TRITON_ROPE: Controls Triton rotary embeddings.
@@ -2228,6 +2296,7 @@ class rocm_aiter_ops:
     _FMOE_ENABLED = envs.VLLM_ROCM_USE_AITER_MOE
     _MLA_ENABLED = envs.VLLM_ROCM_USE_AITER_MLA
     _MHA_ENABLED = envs.VLLM_ROCM_USE_AITER_MHA
+    _VIT_FUSED_ATTN_ENABLED = envs.VLLM_ROCM_USE_AITER_VIT_FUSED_ATTN
     _SHUFFLE_KV_CACHE_ENABLED = envs.VLLM_ROCM_SHUFFLE_KV_CACHE_LAYOUT
     _TRITON_UNIFIED_ATTN_ENABLED = envs.VLLM_ROCM_USE_AITER_UNIFIED_ATTENTION
     # TODO: Consolidate under _LINEAR_ENABLED
@@ -2259,6 +2328,7 @@ class rocm_aiter_ops:
         cls._FMOE_ENABLED = envs.VLLM_ROCM_USE_AITER_MOE
         cls._MLA_ENABLED = envs.VLLM_ROCM_USE_AITER_MLA
         cls._MHA_ENABLED = envs.VLLM_ROCM_USE_AITER_MHA
+        cls._VIT_FUSED_ATTN_ENABLED = envs.VLLM_ROCM_USE_AITER_VIT_FUSED_ATTN
         cls._SHUFFLE_KV_CACHE_ENABLED = envs.VLLM_ROCM_SHUFFLE_KV_CACHE_LAYOUT
         cls._TRITON_UNIFIED_ATTN_ENABLED = envs.VLLM_ROCM_USE_AITER_UNIFIED_ATTENTION
         cls._FP8BMM_ENABLED = envs.VLLM_ROCM_USE_AITER_FP8BMM
@@ -2327,6 +2397,17 @@ class rocm_aiter_ops:
     def is_rdna_linear_enabled(cls) -> bool:
         """RDNA analog of is_linear_enabled() (aiter Triton blockscale)."""
         return cls.is_rdna_aiter_enabled() and cls._LINEAR_ENABLED
+
+    @classmethod
+    def is_rdna_vit_fused_attn_enabled(cls) -> bool:
+        """Vision attention (qkv split, rotary embedding and attention) as one
+        aiter FlyDSL kernel. The kernel is built for gfx11 only (RDNA3 /
+        RDNA3.5), so this is narrower than is_rdna_aiter_enabled()."""
+        if not cls.is_rdna_aiter_enabled() or not cls._VIT_FUSED_ATTN_ENABLED:
+            return False
+        from vllm.platforms.rocm import on_gfx11
+
+        return on_gfx11() and _aiter_has_vit_fused_attn()
 
     @classmethod
     @if_aiter_supported
@@ -3274,6 +3355,14 @@ class rocm_aiter_ops:
                 op_func=_rocm_aiter_fp8_attn_impl,
                 mutates_args=[],
                 fake_impl=_rocm_aiter_fp8_attn_fake,
+                dispatch_key=current_platform.dispatch_key,
+            )
+
+            direct_register_custom_op(
+                op_name="rocm_aiter_vit_qkv_rope_attn",
+                op_func=_rocm_aiter_vit_qkv_rope_attn_impl,
+                mutates_args=[],
+                fake_impl=_rocm_aiter_vit_qkv_rope_attn_fake,
                 dispatch_key=current_platform.dispatch_key,
             )
 
@@ -4668,6 +4757,20 @@ class rocm_aiter_ops:
             scale,
             cu_seqlens,
             max_seqlen,
+        )
+
+    @staticmethod
+    def vit_qkv_rope_attn(
+        qkv: torch.Tensor,
+        num_heads: int,
+        cos: torch.Tensor,
+        sin: torch.Tensor,
+        cu_seqlens: torch.Tensor,
+        max_seqlen: torch.Tensor,
+        scale: float,
+    ) -> torch.Tensor:
+        return torch.ops.vllm.rocm_aiter_vit_qkv_rope_attn(
+            qkv, num_heads, cos, sin, cu_seqlens, max_seqlen, scale
         )
 
     @staticmethod

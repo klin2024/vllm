@@ -43,6 +43,7 @@ from transformers.models.qwen2_5_vl.configuration_qwen2_5_vl import (
 )
 from transformers.video_utils import VideoMetadata
 
+from vllm._aiter_ops import rocm_aiter_ops
 from vllm.compilation.decorators import (
     should_torch_compile_mm_encoder,
     support_torch_compile,
@@ -403,6 +404,16 @@ class Qwen2_5_VisionAttention(nn.Module):
 
         self.apply_rotary_emb = ApplyRotaryEmb(enforce_enable=True)
 
+        # gfx11: qkv split, rotary embedding and attention in one aiter kernel.
+        self.use_aiter_vit_fused_attn = (
+            rocm_aiter_ops.is_rdna_vit_fused_attn_enabled()
+            and self.hidden_size_per_attention_head % 16 == 0
+        )
+        if self.use_aiter_vit_fused_attn:
+            logger.info_once(
+                "Using aiter FlyDSL fused qkv + RoPE + attention for ViT model."
+            )
+
     def forward(
         self,
         x: torch.Tensor,
@@ -416,6 +427,24 @@ class Qwen2_5_VisionAttention(nn.Module):
         # [s, b, c] --> [s, b, head * 3 * head_dim]
         x, _ = self.qkv(x)
         seq_len, batch_size, _ = x.shape
+
+        if (
+            self.use_aiter_vit_fused_attn
+            and batch_size == 1
+            and rotary_pos_emb_cos is not None
+            and rotary_pos_emb_sin is not None
+        ):
+            context_layer = rocm_aiter_ops.vit_qkv_rope_attn(
+                x,
+                self.num_attention_heads_per_partition,
+                rotary_pos_emb_cos,
+                rotary_pos_emb_sin,
+                cu_seqlens,
+                max_seqlen,
+                self.attn.scale,
+            )
+            output, _ = self.proj(context_layer.view(seq_len, batch_size, -1))
+            return output
 
         qkv = einops.rearrange(
             x,
