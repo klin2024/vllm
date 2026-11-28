@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Attention layer with PagedAttention and Triton prefix prefill."""
 
+import os
 from typing import ClassVar
 
 import torch
@@ -199,6 +200,36 @@ class RocmAiterUnifiedAttentionImpl(RocmAttentionImpl):
         # RDNA3 has no low precision MMA, preserve query precision
         self.supports_quant_query_input = not on_gfx11()
 
+        # gfx11 (RDNA3 / RDNA3.5): aiter's FlyDSL paged attention for gfx11
+        # (ROCm/aiter#8868) takes this backend's causal calls as they are (the
+        # interleaved K / V views, the layer's fp32 K / V scales) and is 1.5-1.7x
+        # faster than the Triton kernel on gfx1151 for prefill and mixed
+        # batches. The first causal forward of a layer checks the real tensors;
+        # a call the kernels do not take keeps the layer on the Triton kernel.
+        # VLLM_ROCM_AITER_FLYDSL_UNIFIED_ATTN=0 keeps the Triton kernel.
+        self._flydsl_unified_attention = None
+        self._flydsl_decided = False
+        if (
+            on_gfx11()
+            and os.environ.get("VLLM_ROCM_AITER_FLYDSL_UNIFIED_ATTN", "1") == "1"
+        ):
+            try:
+                from aiter.ops.flydsl.paged_attention_gfx11 import (
+                    flydsl_unified_attention,
+                    gfx11_paged_unsupported_reason,
+                )
+            except ImportError:
+                logger.info_once(
+                    "aiter has no FlyDSL gfx11 paged attention (ROCm/aiter#8868); "
+                    "using the Triton unified attention"
+                )
+            else:
+                self._flydsl_unified_attention = flydsl_unified_attention
+                self._flydsl_unsupported_reason = gfx11_paged_unsupported_reason
+                self._flydsl_arch = torch.cuda.get_device_properties(
+                    torch.cuda.current_device()
+                ).gcnArchName.split(":")[0]
+
         # Layout flag: must mirror get_kv_cache_shape, which is attn_type
         # agnostic because the allocation is shared across layers.
         self._shuffle_kv_layout = (
@@ -208,6 +239,54 @@ class RocmAiterUnifiedAttentionImpl(RocmAttentionImpl):
         self._use_shuffle_kv = (
             self._shuffle_kv_layout and self.attn_type != AttentionType.ENCODER_DECODER
         )
+
+    def _flydsl_takes(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        out: torch.Tensor,
+        cu_seqlens_q: torch.Tensor,
+        seqused_k: torch.Tensor,
+        block_table: torch.Tensor,
+        layer: AttentionLayer,
+        output_scale: torch.Tensor | None,
+    ) -> bool:
+        """Decided once per layer, on the first causal call's real tensors."""
+        if self._flydsl_decided:
+            return self._flydsl_unified_attention is not None
+        self._flydsl_decided = True
+        why = self._flydsl_unsupported_reason(
+            q,
+            k,
+            v,
+            out,
+            cu_seqlens_q,
+            seqused_k,
+            block_table,
+            causal=True,
+            window_size=self.sliding_window,
+            softcap=self.logits_soft_cap,
+            q_descale=None,
+            k_descale=layer._k_scale,
+            v_descale=layer._v_scale,
+            alibi_slopes=self.alibi_slopes,
+            sinks=self.sinks,
+            output_scale=output_scale,
+        )
+        if why is not None:
+            logger.info_once(
+                "FlyDSL gfx11 paged attention does not take this layer's calls "
+                "(%s); using the Triton unified attention",
+                why,
+            )
+            self._flydsl_unified_attention = None
+            return False
+        logger.info_once(
+            "Using aiter's FlyDSL gfx11 paged attention (ROCm/aiter#8868) for the "
+            "causal calls of RocmAiterUnifiedAttentionImpl"
+        )
+        return True
 
     def _split_kv_cache(
         self, kv_cache: torch.Tensor
@@ -309,11 +388,52 @@ class RocmAiterUnifiedAttentionImpl(RocmAttentionImpl):
         block_table = attn_metadata.block_table
 
         if attn_metadata.causal:
+            q = query[:num_actual_tokens]
+            out = output[:num_actual_tokens]
+            if (
+                self._flydsl_unified_attention is not None
+                and not self._use_shuffle_kv
+                and query.dtype != self.fp8_dtype
+                and self._flydsl_takes(
+                    q,
+                    key_cache,
+                    value_cache,
+                    out,
+                    cu_seqlens_q,
+                    seqused_k,
+                    block_table,
+                    layer,
+                    output_scale,
+                )
+            ):
+                self._flydsl_unified_attention(
+                    q,
+                    key_cache,
+                    value_cache,
+                    out,
+                    cu_seqlens_q,
+                    max_seqlen_q,
+                    seqused_k,
+                    max_seqlen_k,
+                    softmax_scale,
+                    True,
+                    self.sliding_window,
+                    block_table,
+                    self.logits_soft_cap,
+                    None,
+                    layer._k_scale,
+                    layer._v_scale,
+                    alibi_slopes=self.alibi_slopes,
+                    sinks=self.sinks,
+                    output_scale=output_scale,
+                    arch=self._flydsl_arch,
+                )
+                return output
             self.unified_attention(
-                q=query[:num_actual_tokens],
+                q=q,
                 k=key_cache,
                 v=value_cache,
-                out=output[:num_actual_tokens],
+                out=out,
                 cu_seqlens_q=cu_seqlens_q,
                 max_seqlen_q=max_seqlen_q,
                 seqused_k=seqused_k,
